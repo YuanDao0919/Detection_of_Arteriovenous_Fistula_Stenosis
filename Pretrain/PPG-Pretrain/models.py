@@ -420,34 +420,34 @@ class PPGPretrainModel(nn.Module):
             z2 = self.encoder(x2) if x2 is not None else None
             
             # 掩码重构特征
-            mask_batch = []
-            masked_x1 = x1.clone()
-            
-            for i in range(batch_size):
-                mask = self.mask_generator.generate_mask(x1.size(1))
-                masked_x1[i, mask] = 0.0  # 掩蔽信号部分设为0
-                mask_batch.append(mask)
-            
-            mask_tensor = torch.stack(mask_batch)
+            # 批量掩码生成（GPU 向量化）
+            mask_tensor = self.mask_generator.generate_mask_batch(batch_size, x1.size(1), device=x1.device)
+            masked_x1 = x1.masked_fill(mask_tensor, 0.0)
+            # 批量掩码生成（GPU 向量化）
+            mask_tensor = self.mask_generator.generate_mask_batch(batch_size, x1.size(1), device=x1.device)
+            masked_x1 = x1.masked_fill(mask_tensor, 0.0)
             z_masked = self.encoder(masked_x1)
             
-            # 池化序列特征，用于交叉门控
-            # 此处为简化计算，使用平均池化将时序特征压缩为单一特征向量
-            z1_pooled = torch.mean(z1, dim=1)  # [batch_size, feature_dim]
-            z_masked_pooled = torch.mean(z_masked, dim=1)  # [batch_size, feature_dim]
-            
-            # 应用交叉门控
-            enhanced_z1_pooled, enhanced_z_masked_pooled = self.cross_gating(z1_pooled, z_masked_pooled)
-            
-            # 将增强后的特征扩展回序列维度
-            enhanced_z1 = enhanced_z1_pooled.unsqueeze(1).expand(-1, z1.size(1), -1)  # [batch_size, seq_len, feature_dim]
-            enhanced_z_masked = enhanced_z_masked_pooled.unsqueeze(1).expand(-1, z_masked.size(1), -1)
-            
-            # 如果有第二个对比样本，也应用相同的增强
+            # 池化得到门控生成所需的全局摘要，但对序列逐时刻做特征变换与门控，保留时间信息
+            z1_pooled = torch.mean(z1, dim=1)            # [B, C]
+            z_masked_pooled = torch.mean(z_masked, dim=1)  # [B, C]
+
+            # 基于对方全局摘要生成门控向量（[B, C]）
+            gate_for_contrastive = self.cross_gating.gate_reconstruction(z_masked_pooled)   # 用重构摘要门控对比
+            gate_for_reconstruction = self.cross_gating.gate_contrastive(z1_pooled)         # 用对比摘要门控重构
+
+            # 对序列逐时刻做可学习变换（Linear+LayerNorm 可对 [B, T, C] 直接作用）
+            transformed_contrastive_seq = self.cross_gating.transform_contrastive(z1)       # [B, T, C]
+            transformed_reconstruction_seq = self.cross_gating.transform_reconstruction(z_masked)  # [B, T, C]
+
+            # 广播门控到时间维并进行逐时刻门控
+            enhanced_z1 = z1 + transformed_contrastive_seq * gate_for_contrastive.unsqueeze(1)
+            enhanced_z_masked = z_masked + transformed_reconstruction_seq * gate_for_reconstruction.unsqueeze(1)
+
+            # 如果有第二个对比样本，也应用相同的门控策略
             if z2 is not None:
-                z2_pooled = torch.mean(z2, dim=1)
-                _, enhanced_z2_pooled = self.cross_gating(z2_pooled, z_masked_pooled)
-                enhanced_z2 = enhanced_z2_pooled.unsqueeze(1).expand(-1, z2.size(1), -1)
+                transformed_z2 = self.cross_gating.transform_contrastive(z2)
+                enhanced_z2 = z2 + transformed_z2 * gate_for_contrastive.unsqueeze(1)
             else:
                 enhanced_z2 = None
             

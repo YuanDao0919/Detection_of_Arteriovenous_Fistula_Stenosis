@@ -29,7 +29,7 @@ def main():
     
     # 训练超参数设置
     batch_size = 64        # 批次大小，影响显存占用和训练速度
-    epochs = 5            # 总训练轮数
+    epochs = 50            # 总训练轮数
     learning_rate = 1e-4   # 初始学习率
     
     # 模型结构参数
@@ -39,7 +39,7 @@ def main():
     
     # 损失函数权重：平衡两个预训练任务
     lambda_contrast = 1.0  # 对比学习损失权重
-    lambda_recon = 1.5     # 掩码重构损失权重
+    lambda_recon = 1.0     # 掩码重构损失权重
     
     # 模型保存路径
     save_dir = '/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/pretrain/模型output'
@@ -60,24 +60,52 @@ def main():
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
-    # 创建数据加载器，设置并行工作进程加速数据加载
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    # 创建数据加载器配置（兼容 CUDA / MPS / CPU）
+    if torch.cuda.is_available():
+        dl_cfg = dict(num_workers=min(8, os.cpu_count() or 4),
+                      persistent_workers=True, prefetch_factor=4, pin_memory=True)
+    elif torch.backends.mps.is_available():
+        dl_cfg = dict(num_workers=min(8, os.cpu_count() or 4),
+                      persistent_workers=True, prefetch_factor=2, pin_memory=False)
+    else:
+        dl_cfg = dict(num_workers=0, persistent_workers=False, prefetch_factor=2, pin_memory=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        **dl_cfg
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        **dl_cfg
+    )
     
     print(f"数据集加载完成，训练集大小: {train_size}，验证集大小: {val_size}")
     
-    # ================ 设置设备 ================
-    # 自动检测并使用GPU（如果可用）
-    # 检测是否支持 MPS（Apple Silicon GPU）
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("使用设备: Apple Silicon GPU (MPS)")
-    elif torch.cuda.is_available():
+    # ================ 设置设备（优先 CUDA，其次 MPS） ================
+    if torch.cuda.is_available():
         device = torch.device("cuda")
         print("使用设备: NVIDIA GPU (CUDA)")
+        use_compile = True
+        use_autocast = True
+        autocast_dtype = torch.float16
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("使用设备: Apple Silicon GPU (MPS)")
+        use_compile = False
+        use_autocast = False
+        autocast_dtype = torch.bfloat16
     else:
         device = torch.device("cpu")
         print("使用设备: CPU")
+        use_compile = False
+        use_autocast = False
+        autocast_dtype = torch.float32
     
     # ================ 初始化模型 ================
     print("初始化模型...")
@@ -85,6 +113,12 @@ def main():
     model = PPGPretrainModel(signal_length=signal_length, feature_dim=feature_dim, mask_ratio=mask_ratio)
     # 将模型转移到指定设备（GPU或CPU）
     model = model.to(device)
+    if use_compile:
+        try:
+            model = torch.compile(model)
+            print("已启用 torch.compile")
+        except Exception:
+            print("torch.compile 不可用或失败，已回退")
     
     # ================ 优化器设置 ================
     # 使用Adam优化器，自适应学习率优化算法
@@ -147,7 +181,7 @@ def main():
         train_contrast_loss, train_recon_loss, train_loss = train(
             model, train_loader, optimizer, device, epoch, 
             lambda_contrast, lambda_recon, 
-            visualize_interval=10,  # 每100个batch保存一次重构可视化
+            visualize_interval=200,  # 减少I/O与绘图开销
             save_dir='./visualizations'
         )
         

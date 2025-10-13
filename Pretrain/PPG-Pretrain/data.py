@@ -65,6 +65,56 @@ class MaskGenerator:
         
         return mask
 
+    def generate_mask_batch(self, batch_size: int, signal_length: int, device=None) -> torch.Tensor:
+        """
+        批量生成布尔掩码 [B, L]，向量化实现，支持 GPU。
+        当前采用近似策略：先按 mask_ratio 计算每样本需要掩码的点数，再随机选取若干起点与段长，写入掩码张量。
+        为避免 Python 循环，段数量固定为根据期望长度估算的上限，并用广播写入；不足的部分通过裁剪控制。
+        """
+        if device is None:
+            device = torch.device('cpu')
+        B, L = batch_size, signal_length
+        dtype_bool = torch.bool
+
+        total_mask_points = int(L * self.mask_ratio)
+        if total_mask_points <= 0:
+            return torch.zeros(B, L, device=device, dtype=dtype_bool)
+
+        # 估算每段平均长度与段数上限（避免 while），长度>=1
+        mean_len = max(1, int(self.mask_length_mean))
+        # 至少 1 段，最多不超过信号长度
+        max_segments = max(1, min(total_mask_points, L) // mean_len + 1)
+
+        # 采样每个样本、每段的长度（截断在 [1, total_mask_points]）
+        # 用正态近似，后续裁剪到合法范围
+        lens = torch.normal(
+            mean=float(self.mask_length_mean), std=float(self.mask_length_std),
+            size=(B, max_segments), device=device
+        ).clamp(min=1.0, max=float(total_mask_points)).round().to(torch.long)
+
+        # 保证每样本总长度不超过 total_mask_points：按行做前缀和并截断
+        cumsum = torch.cumsum(lens, dim=1)
+        # 构造掩码，标记哪些段被保留（前缀和<=total_mask_points）
+        keep = cumsum <= total_mask_points
+        # 对超过的段长度置 0
+        lens = lens * keep.to(lens.dtype)
+
+        # 采样起点，确保 start+len<=L
+        # 为避免非法起点，先将 len==0 的段起点置 0，不会生效
+        max_start = torch.clamp(L - lens, min=0)
+        # torch.randint 的 high 需要 >=1，处理全 0 的位置
+        high = torch.maximum(max_start, torch.ones_like(max_start))
+        # 逐元素向量化起点采样：rand*[0,high) 向下取整，避免 .item() 与 graph break
+        starts = (torch.rand(B, max_segments, device=device, dtype=torch.float32) * high.to(torch.float32)).floor().to(torch.long)
+
+        # 构造索引：为每段生成 [start, start+len) 的索引范围
+        # 展开为 [B, S, L] 的布尔矩阵，指示该段覆盖的位置
+        idx = torch.arange(L, device=device).view(1, 1, L)
+        seg_mask = (idx >= starts.unsqueeze(-1)) & (idx < (starts + lens).unsqueeze(-1))  # [B,S,L]
+        # 聚合所有段
+        mask = seg_mask.any(dim=1)  # [B,L]
+        return mask
+
 
 #--------------------------------数据集--------------------------------
 
@@ -159,6 +209,25 @@ class DataAugmenter:
         noise = np.random.normal(0, sigma, signal.shape)
         return signal + noise
 
+    def add_gaussian_noise_batch(self, signals: torch.Tensor, sigma_range=(0.01, 0.05)) -> torch.Tensor:
+        """
+        基于 torch 的批量高斯噪声增强，保持与输入相同 device 与 dtype。
+        参数:
+            signals: [B, L] 的张量
+            sigma_range: (min, max)
+        返回:
+            [B, L] 的张量
+        """
+        if signals.ndim != 2:
+            raise ValueError("signals must be 2D tensor [B, L]")
+        device = signals.device
+        dtype = signals.dtype
+        batch_size, length = signals.shape
+        sigma_min, sigma_max = sigma_range
+        sigmas = torch.empty(batch_size, 1, device=device, dtype=dtype).uniform_(sigma_min, sigma_max)
+        noise = torch.randn(batch_size, length, device=device, dtype=dtype) * sigmas
+        return signals + noise
+
 
 
 
@@ -201,11 +270,13 @@ class DataAugmenter:
         --------------------------------------------------------------
         signal : ndarray
             输入信号，shape (length,) 或 (batch, length)
+
         fs : int
             采样率，用于把频率转成采样点
+
         mode : str
-            'sin'   : 原单频正弦（可复现论文）
-            'mix'   : 扫频 + 随机游走（推荐，更真实）
+            'sin'   : 原单频正弦（
+            'mix'   : 扫频 + 随机游走
             
         返回
         --------------------------------------------------------------
@@ -216,7 +287,7 @@ class DataAugmenter:
         length = signal.shape[-1]
         t = np.arange(length, dtype=np.float32) / fs   # 秒时间轴
             
-        if mode == 'sin':                     # === 原论文风格 ===
+        if mode == 'sin': 
             freq = np.random.uniform(0.05, 0.1)          # Hz
             amp  = np.random.uniform(0.02, 0.05)         # 幅值
             baseline = amp * np.sin(2 * np.pi * freq * t)
@@ -251,6 +322,60 @@ class DataAugmenter:
         from scipy.signal import butter, filtfilt
         b, a = butter(order, cutoff / (fs / 2), btype='high')
         return filtfilt(b, a, data).astype(np.float32)
+
+
+    def add_baseline_wander_batch(self, signals: torch.Tensor,
+                                  fs: int = 50,
+                                  mode: str = 'mix') -> torch.Tensor:
+        """
+        基于 torch 的批量基线漂移（默认正弦版本，便于在 GPU 上高效运行）。
+        参数:
+            signals: [B, L]
+            fs: 采样率
+            mode: 目前支持 'sin'（更快）和 'mix'（更真实）。
+        返回:
+            [B, L]
+        """
+        if signals.ndim != 2:
+            raise ValueError("signals must be 2D tensor [B, L]")
+        device = signals.device
+        dtype = signals.dtype
+        batch_size, length = signals.shape
+        t = torch.arange(length, device=device, dtype=dtype) / float(fs)
+        if mode == 'sin':
+            # 为每个样本采样频率与幅值
+            freq = torch.empty(batch_size, 1, device=device, dtype=dtype).uniform_(0.05, 0.1)
+            amp = torch.empty(batch_size, 1, device=device, dtype=dtype).uniform_(0.02, 0.05)
+            baseline = amp * torch.sin(2 * torch.pi * freq * t)  # [B, L]
+            return signals + baseline
+        elif mode == 'mix':
+            # 1) 呼吸扫频 0.15–0.4 Hz，幅度 1–3 %
+            f_breath = torch.empty(batch_size, 1, device=device, dtype=dtype).uniform_(0.15, 0.4)
+            f_dev    = torch.empty(batch_size, 1, device=device, dtype=dtype).uniform_(0.02, 0.05)
+            amp_b    = torch.empty(batch_size, 1, device=device, dtype=dtype).uniform_(0.01, 0.03)
+            inner = 2 * torch.pi * 0.05 * t  # 0.05 Hz 调制
+            breath_freq = f_breath + f_dev * torch.sin(inner)  # [B,1] + [1,L]广播为 [B,L]
+            breath = amp_b * torch.sin(2 * torch.pi * breath_freq * t)  # [B,L]
+
+            # 2) 随机游走 + 简单高通（IIR 一阶高通，fc≈0.02Hz）
+            # 生成高斯噪声并累加为随机游走
+            walk_noise = torch.randn(batch_size, length, device=device, dtype=dtype) * 0.005
+            walk = torch.cumsum(walk_noise, dim=1)
+            # 一阶高通滤波：y[n] = alpha*(y[n-1] + x[n] - x[n-1])
+            fc = 0.02
+            dt = 1.0 / float(fs)
+            rc = 1.0 / (2.0 * torch.pi * fc)
+            alpha = (rc / (rc + dt)).to(dtype)
+            y = torch.zeros(batch_size, length, device=device, dtype=dtype)
+            # 初始化
+            y[:, 0] = 0.0
+            for n in range(1, length):
+                y[:, n] = alpha * (y[:, n - 1] + walk[:, n] - walk[:, n - 1])
+
+            baseline = breath + y
+            return signals + baseline
+        else:
+            raise ValueError("mode must be 'sin' or 'mix'")
     
 
 
@@ -266,7 +391,7 @@ class DataAugmenter:
 
 
 
-    def ryandom_scale(self, signal, scale_range=(0.9, 1.1)):
+    def random_scale(self, signal, scale_range=(0.9, 1.1)):
         """
         随机缩放信号幅度
         
@@ -279,6 +404,24 @@ class DataAugmenter:
         """
         scale = np.random.uniform(scale_range[0], scale_range[1])
         return signal * scale
+
+    def random_scale_batch(self, signals: torch.Tensor, scale_range=(0.9, 1.1)) -> torch.Tensor:
+        """
+        基于 torch 的批量随机幅度缩放。
+        参数:
+            signals: [B, L]
+            scale_range: (min, max)
+        返回:
+            [B, L]
+        """
+        if signals.ndim != 2:
+            raise ValueError("signals must be 2D tensor [B, L]")
+        device = signals.device
+        dtype = signals.dtype
+        batch_size = signals.shape[0]
+        smin, smax = scale_range
+        scales = torch.empty(batch_size, 1, device=device, dtype=dtype).uniform_(smin, smax)
+        return signals * scales
     
 
 
@@ -304,19 +447,71 @@ class DataAugmenter:
         if 0 in augs:
             augmented = self.add_gaussian_noise(augmented)
         if 1 in augs:
-            augmented = self.add_baseline_wander(augmented, len(signal))
+            augmented = self.add_baseline_wander(augmented, fs=50, mode='mix')
         if 2 in augs:
             augmented = self.random_scale(augmented)
             
-        return augmented
-        # noinspection PyUnreachableCode
+        return augmented 
         '''
-        
+
         对于PPG信号，当前的顺序可能更合理，因为：
-        
-            基线漂移通常反映生理状态（呼吸、运动）
-            噪声通常是测量设备的固有特性
-            幅度缩放可能反映个体差异或测量条件
-            在真实场景中，个体差异（幅度缩放）应该影响整个测量结果，包括噪声和漂移。
-                        
+        基线漂移通常反映生理状态（呼吸、运动）
+        噪声通常是测量设备的固有特性
+        幅度缩放可能反映个体差异或测量条件
+        在真实场景中，个体差异（幅度缩放）应该影响整个测量结果，包括噪声和漂移。
+                
         '''
+
+    def augment_batch(self, signals: torch.Tensor,
+                      use_gaussian_noise: bool = True,
+                      use_baseline_wander: bool = True,
+                      use_random_scale: bool = True,
+                      fs: int = 50) -> torch.Tensor:
+        """
+        批量增强：对 [B, L] 张量进行 1-2 种轻微增强（逐样本随机）。
+        为了速度，基线漂移采用 sin 模式，所有操作在 signals.device 上执行。
+        返回新的张量，不修改原张量。
+        """
+        if signals.ndim != 2:
+            raise ValueError("signals must be 2D tensor [B, L]")
+        device = signals.device
+        out = signals.clone()
+
+        batch_size = signals.shape[0]
+        # 随机决定每个样本应用多少种增强（1 或 2）
+        num_augs = torch.randint(low=1, high=3, size=(batch_size,), device=device)
+
+        # 为每个样本随机选择两种增强（可能会重复，稍后用 num_augs 控制）
+        choices = torch.randint(low=0, high=3, size=(batch_size, 2), device=device)
+
+        # 掩码：每个样本是否启用某增强
+        apply_noise = (choices[:, 0] == 0) | ((choices[:, 1] == 0) & (num_augs == 2))
+        apply_baseline = (choices[:, 0] == 1) | ((choices[:, 1] == 1) & (num_augs == 2))
+        apply_scale = (choices[:, 0] == 2) | ((choices[:, 1] == 2) & (num_augs == 2))
+
+        if use_gaussian_noise and apply_noise.any():
+            out_noise = self.add_gaussian_noise_batch(out[apply_noise])
+            out[apply_noise] = out_noise
+
+        if use_baseline_wander and apply_baseline.any():
+            out_bl = self.add_baseline_wander_batch(out[apply_baseline], fs=fs, mode='sin')
+            out[apply_baseline] = out_bl
+
+        if use_random_scale and apply_scale.any():
+            out_sc = self.random_scale_batch(out[apply_scale])
+            out[apply_scale] = out_sc
+
+        return out
+
+    def augment_pair_batch(self, signals: torch.Tensor,
+                           use_gaussian_noise: bool = True,
+                           use_baseline_wander: bool = True,
+                           use_random_scale: bool = True,
+                           fs: int = 50) -> tuple:
+        """
+        生成两组独立随机的数据增强视图（对比学习常用）。
+        输入/输出均为 [B, L]，保持与输入相同的 device 与 dtype。
+        """
+        x1 = self.augment_batch(signals, use_gaussian_noise, use_baseline_wander, use_random_scale, fs)
+        x2 = self.augment_batch(signals, use_gaussian_noise, use_baseline_wander, use_random_scale, fs)
+        return x1, x2

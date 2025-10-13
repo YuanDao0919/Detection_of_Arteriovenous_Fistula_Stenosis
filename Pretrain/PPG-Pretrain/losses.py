@@ -1,7 +1,11 @@
 import torch
 import torch.nn.functional as F
 
-def hierarchical_contrastive_loss(z1, z2, alpha=0.5, temporal_unit=0):
+def hierarchical_contrastive_loss(z1, z2, alpha=0.5, temporal_unit=0,
+                                  instance_time_stride: int = 1,
+                                  temporal_stride: int = 1,
+                                  temperature: float = 0.1,
+                                  normalize: bool = True):
     """
 
    ----------------------------------多尺度层次对比损失-------------------------------------
@@ -26,9 +30,19 @@ def hierarchical_contrastive_loss(z1, z2, alpha=0.5, temporal_unit=0):
 
     # ------------ Scale 1: 原始尺度 ------------
     if alpha != 0:
-        total_loss += alpha * instance_contrastive_loss(z1, z2)
+        total_loss += alpha * instance_contrastive_loss(
+            z1, z2,
+            time_stride=instance_time_stride,
+            temperature=temperature,
+            normalize=normalize
+        )
     if (1 - alpha) != 0 and d >= temporal_unit:
-        total_loss += (1 - alpha) * temporal_contrastive_loss(z1, z2)
+        total_loss += (1 - alpha) * temporal_contrastive_loss(
+            z1, z2,
+            time_stride=temporal_stride,
+            temperature=temperature,
+            normalize=normalize
+        )
     d += 1
 
     # ------------ Scale 2: 下采样 1 次 (1/2) ------------
@@ -36,9 +50,19 @@ def hierarchical_contrastive_loss(z1, z2, alpha=0.5, temporal_unit=0):
     z2_half = F.max_pool1d(z2.transpose(1, 2), kernel_size=2).transpose(1, 2)
 
     if alpha != 0:
-        total_loss += alpha * instance_contrastive_loss(z1_half, z2_half)
+        total_loss += alpha * instance_contrastive_loss(
+            z1_half, z2_half,
+            time_stride=instance_time_stride,
+            temperature=temperature,
+            normalize=normalize
+        )
     if (1 - alpha) != 0 and d >= temporal_unit:
-        total_loss += (1 - alpha) * temporal_contrastive_loss(z1_half, z2_half)
+        total_loss += (1 - alpha) * temporal_contrastive_loss(
+            z1_half, z2_half,
+            time_stride=temporal_stride,
+            temperature=temperature,
+            normalize=normalize
+        )
     d += 1
 
     # ------------ Scale 3: 再次下采样 (1/4) ------------
@@ -46,16 +70,26 @@ def hierarchical_contrastive_loss(z1, z2, alpha=0.5, temporal_unit=0):
     z2_quarter = F.max_pool1d(z2_half.transpose(1, 2), kernel_size=2).transpose(1, 2)
 
     if alpha != 0:
-        total_loss += alpha * instance_contrastive_loss(z1_quarter, z2_quarter)
+        total_loss += alpha * instance_contrastive_loss(
+            z1_quarter, z2_quarter,
+            time_stride=instance_time_stride,
+            temperature=temperature,
+            normalize=normalize
+        )
     if (1 - alpha) != 0 and d >= temporal_unit:
-        total_loss += (1 - alpha) * temporal_contrastive_loss(z1_quarter, z2_quarter)
+        total_loss += (1 - alpha) * temporal_contrastive_loss(
+            z1_quarter, z2_quarter,
+            time_stride=temporal_stride,
+            temperature=temperature,
+            normalize=normalize
+        )
     d += 1
 
     # 将3个尺度的损失取平均
     return total_loss / d
 
 
-def instance_contrastive_loss(z1, z2):
+def instance_contrastive_loss(z1, z2, time_stride: int = 1, temperature: float = 0.1, normalize: bool = True):
     """
 
     --------------------------------------------样本（实例）间对比损失---------------------------------------
@@ -72,9 +106,18 @@ def instance_contrastive_loss(z1, z2):
     B, T = z1.size(0), z1.size(1)
     if B == 1:
         return z1.new_tensor(0.)
+    # 时间下采样（stride）
+    if time_stride > 1:
+        z1 = z1[:, ::time_stride]
+        z2 = z2[:, ::time_stride]
+        T = z1.size(1)
+    # 特征归一化
+    if normalize:
+        z1 = torch.nn.functional.normalize(z1, dim=-1)
+        z2 = torch.nn.functional.normalize(z2, dim=-1)
     z = torch.cat([z1, z2], dim=0)  # 2B x T x C
     z = z.transpose(0, 1)  # T x 2B x C
-    sim = torch.matmul(z, z.transpose(1, 2))  # T x 2B x 2B
+    sim = torch.matmul(z, z.transpose(1, 2)) / temperature  # 温度缩放
     logits = torch.tril(sim, diagonal=-1)[:, :, :-1]    # T x 2B x (2B-1)
     logits += torch.triu(sim, diagonal=1)[:, :, 1:]
     logits = -F.log_softmax(logits, dim=-1)
@@ -84,7 +127,7 @@ def instance_contrastive_loss(z1, z2):
     return loss
 
 
-def temporal_contrastive_loss(z1, z2):
+def temporal_contrastive_loss(z1, z2, time_stride: int = 1, temperature: float = 0.1, normalize: bool = True):
     """
 
     ------------------------------------------时间维度对比损失--------------------------------------------
@@ -101,8 +144,17 @@ def temporal_contrastive_loss(z1, z2):
     B, T = z1.size(0), z1.size(1)
     if T == 1:
         return z1.new_tensor(0.)
+    # 时间下采样（stride）
+    if time_stride > 1:
+        z1 = z1[:, ::time_stride]
+        z2 = z2[:, ::time_stride]
+        T = z1.size(1)
+    # 特征归一化
+    if normalize:
+        z1 = torch.nn.functional.normalize(z1, dim=-1)
+        z2 = torch.nn.functional.normalize(z2, dim=-1)
     z = torch.cat([z1, z2], dim=1)  # B x 2T x C
-    sim = torch.matmul(z, z.transpose(1, 2))  # B x 2T x 2T
+    sim = torch.matmul(z, z.transpose(1, 2)) / temperature  # 温度缩放
     logits = torch.tril(sim, diagonal=-1)[:, :, :-1]    # B x 2T x (2T-1)
     logits += torch.triu(sim, diagonal=1)[:, :, 1:]
     logits = -F.log_softmax(logits, dim=-1)
