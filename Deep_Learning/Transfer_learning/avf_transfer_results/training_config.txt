@@ -1,0 +1,7 @@
+data_folder: /Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/data/九院自采数据集/分段后数据（可直接输入模型）/2 pos
+pretrained_model: /Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/pretrain/模型output/ppg_pretrain_20251017_163254_encoder_best.pth
+save_dir: /Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/深度学习/Transfer_learning/avf_transfer_results
+seed: 42
+epochs: 100
+lr: 0.001
+batch_size: 32
