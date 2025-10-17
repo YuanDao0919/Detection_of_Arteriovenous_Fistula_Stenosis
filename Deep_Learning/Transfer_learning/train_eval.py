@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import json
 import pandas as pd
 import seaborn as sns
+import math
 
 from data import AVFDataset, set_seed
 from model import Encoder, ImprovedAVFClassifier
@@ -133,6 +134,138 @@ def evaluate_model(model, data_loader, criterion=None):
 
     return result
 
+
+# ========= 频域/时频 可解释性（基于最终判断分数） =========
+def _score_class_logit(model, x: torch.Tensor, target_class: int, device: torch.device) -> float:
+    """返回 score = main_out[:, target_class] 的标量分数。x: [1, L]"""
+    model.eval()
+    with torch.no_grad():
+        main_outputs, _, _ = model(x.to(device))
+        score = float(main_outputs[:, target_class].item())
+    return score
+
+
+def generate_frequency_band_importance_cls(model,
+                                           sample_signal: torch.Tensor,
+                                           device: torch.device,
+                                           save_path: str,
+                                           target_class: int,
+                                           fs: float = 50.0,
+                                           f_max: float = 10.0,
+                                           num_bands: int = 10):
+    """
+    频带遮挡：对[0, f_max]分成 num_bands 个频带，逐带置零，
+    通过分数下降量（baseline - occluded）作为重要性，绘制柱状图。
+    目标分数为模型主分类输出在 target_class 上的 logit。
+    """
+    x = sample_signal.unsqueeze(0).to(device)  # [1, L]
+    L = x.shape[1]
+
+    # baseline 分数
+    baseline_score = _score_class_logit(model, x, target_class, device)
+
+    # 频率轴
+    freqs = torch.fft.rfftfreq(n=L, d=1.0 / fs).to(device)
+    k_max = int((freqs <= f_max).nonzero(as_tuple=True)[0][-1].item()) if (freqs <= f_max).any() else freqs.numel() - 1
+
+    band_edges = np.linspace(0.0, f_max, num_bands + 1)
+    importances = []
+    centers = []
+
+    X = torch.fft.rfft(x, dim=-1)
+
+    for i in range(num_bands):
+        f0, f1 = band_edges[i], band_edges[i + 1]
+        centers.append(0.5 * (f0 + f1))
+        # 复制谱并置零该频带
+        Xi = X.clone()
+        band_mask = (freqs >= f0) & (freqs < f1)
+        # 限制到 f_max 范围
+        band_mask = band_mask & (torch.arange(freqs.numel(), device=device) <= k_max)
+        Xi[:, band_mask] = 0
+        xi = torch.fft.irfft(Xi, n=L, dim=-1)
+        occluded_score = _score_class_logit(model, xi, target_class, device)
+        importances.append(max(0.0, baseline_score - occluded_score))
+
+    # 绘图
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    plt.figure(figsize=(10, 4))
+    plt.bar(centers, importances, width=(f_max / num_bands) * 0.9, color='steelblue', edgecolor='k')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Importance (Δscore)')
+    plt.title('Band Occlusion Importance (0-%.1f Hz, %d bands)' % (f_max, num_bands))
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+
+def generate_time_frequency_heatmap_cls(model,
+                                        sample_signal: torch.Tensor,
+                                        device: torch.device,
+                                        save_path: str,
+                                        target_class: int,
+                                        fs: float = 50.0,
+                                        f_max: float = 10.0,
+                                        vf_bins: int = 16,
+                                        ht_bins: int = 16,
+                                        n_fft: int = 256,
+                                        hop_length: int = None):
+    """
+    时频遮挡热力图：基于 STFT 将谱在时-频网格上分块置零，
+    以分数下降量构建 [freq_bin, time_bin] 的重要性热图。
+    目标分数为模型主分类输出在 target_class 上的 logit。
+    """
+    x = sample_signal.unsqueeze(0).to(device)  # [1, L]
+    L = x.shape[1]
+    duration = L / fs
+
+    baseline_score = _score_class_logit(model, x, target_class, device)
+
+    if hop_length is None:
+        # 约 ht_bins 帧
+        hop_length = max(1, math.floor((L - n_fft) / max(1, (ht_bins - 1)))) if L > n_fft else max(1, L // max(2, ht_bins))
+
+    window = torch.hann_window(n_fft, device=device)
+    S = torch.stft(x, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True, center=True)
+    # S: [1, F, T]
+    S = S[0]
+    F_bins, T_bins = S.shape
+
+    freqs = torch.fft.rfftfreq(n=n_fft, d=1.0 / fs).to(device)
+    k_max = int((freqs <= f_max).nonzero(as_tuple=True)[0][-1].item()) if (freqs <= f_max).any() else F_bins - 1
+
+    # 将 0..k_max 划分为 vf_bins 组，将 0..T-1 划分为 ht_bins 组
+    def make_bins(n, bins):
+        idx = np.linspace(0, n, bins + 1).astype(int)
+        return [(idx[i], idx[i + 1]) for i in range(bins) if idx[i] < idx[i + 1]]
+
+    freq_groups = make_bins(k_max + 1, vf_bins)
+    time_groups = make_bins(T_bins, ht_bins)
+
+    heat = np.zeros((len(freq_groups), len(time_groups)), dtype=np.float32)
+
+    for fi, (fs_idx, fe_idx) in enumerate(freq_groups):
+        for ti, (ts_idx, te_idx) in enumerate(time_groups):
+            S2 = S.clone()
+            S2[fs_idx:fe_idx, ts_idx:te_idx] = 0
+            x_rec = torch.istft(S2.unsqueeze(0), n_fft=n_fft, hop_length=hop_length, window=window, length=L, center=True)
+            score = _score_class_logit(model, x_rec, target_class, device)
+            heat[fi, ti] = max(0.0, baseline_score - score)
+
+    # 绘制热力图（频率纵轴，时间横轴）
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    plt.figure(figsize=(10, 6))
+    extent = [0, duration, 0, f_max]
+    plt.imshow(heat, origin='lower', aspect='auto', extent=extent, cmap='magma')
+    plt.colorbar(label='Importance (Δscore)')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Frequency (Hz)')
+    plt.title('Time-Frequency Occlusion Heatmap')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 # 训练函数
 def train_transfer_model(model, train_loader, val_loader, num_epochs=100, initial_lr=0.001, 
                          save_dir="./avf_transfer_results_no_augmentation"):
@@ -205,6 +338,52 @@ def train_transfer_model(model, train_loader, val_loader, num_epochs=100, initia
         print(f"Val Precision: {val_result['precision']:.4f} | Val Recall: {val_result['recall']:.4f}")
         print(f"每类F1分数: 类别0: {val_result['class_f1'][0]:.4f}, 类别1: {val_result['class_f1'][1]:.4f}, 类别2: {val_result['class_f1'][2]:.4f}")
         print(f"二分类指标: Sensitivity: {val_result['binary_sensitivity']:.4f}, Specificity: {val_result['binary_specificity']:.4f}, Binary F1: {val_result['binary_f1']:.4f}")
+
+        # === 每个 epoch 末尾：针对验证集首样本，生成频带柱状与时频热力图（目标=当前预测类别的logit） ===
+        try:
+            base_explain_dir = os.path.join(os.path.dirname(__file__), 'explain_figs')
+            os.makedirs(base_explain_dir, exist_ok=True)
+            # 取验证集首个batch的首个样本
+            first_batch = next(iter(val_loader))
+            sample_signal = first_batch['signal'][0].to(device)  # [L]
+            with torch.no_grad():
+                main_outputs, _, _ = model(sample_signal.unsqueeze(0))
+                pred_class = int(torch.argmax(main_outputs, dim=1).item())
+
+            fold_tag = os.path.basename(save_dir.rstrip(os.sep))
+            band_path = os.path.join(base_explain_dir, f'band_{fold_tag}_epoch_{epoch+1}.png')
+            tf_path = os.path.join(base_explain_dir, f'tf_{fold_tag}_epoch_{epoch+1}.png')
+
+            generate_frequency_band_importance_cls(
+                model,
+                sample_signal=sample_signal,
+                device=device,
+                save_path=band_path,
+                target_class=pred_class,
+                fs=50.0,
+                f_max=10.0,
+                num_bands=10
+            )
+            print(f"频带遮挡柱状图已保存: {band_path}")
+
+            enable_tf_heatmap = True
+            if enable_tf_heatmap:
+                generate_time_frequency_heatmap_cls(
+                    model,
+                    sample_signal=sample_signal,
+                    device=device,
+                    save_path=tf_path,
+                    target_class=pred_class,
+                    fs=50.0,
+                    f_max=10.0,
+                    vf_bins=16,
+                    ht_bins=16,
+                    n_fft=256,
+                    hop_length=None
+                )
+                print(f"时频遮挡热力图已保存: {tf_path}")
+        except Exception as e:
+            print(f"生成正式模型频域解释失败（跳过，不影响训练）：{e}")
 
         if val_result['accuracy'] > best_val_acc or (val_result['accuracy'] == best_val_acc and val_result['f1_score'] > best_val_f1_macro):
             best_val_acc = val_result['accuracy']
@@ -282,9 +461,9 @@ def train_transfer_model(model, train_loader, val_loader, num_epochs=100, initia
 # 主函数
 def main():
     set_seed(42)
-    data_folder = "/home/swucar/cyz/1 pos"
-    pretrained_model_path = "/home/swucar/cyz/bloodpressure/330codeL1L2/ppg_pretrain_models/ppg_pretrain_20250330_214849_encoder_best.pth"
-    save_dir = "/home/swucar/cyz/bloodpressure/329code/duibishiyanjieg/fusion_claude筛选"
+    data_folder = "/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/data/九院自采数据集/分段后数据（可直接输入模型）/2 pos"
+    pretrained_model_path = "/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/pretrain/模型output/ppg_pretrain_20251017_163254_encoder_best.pth"
+    save_dir = "/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/深度学习/Transfer_learning/avf_transfer_results"
     os.makedirs(save_dir, exist_ok=True)
 
     print(f"正在加载预训练模型: {pretrained_model_path}")

@@ -11,15 +11,16 @@ from train_eval import main as training_main
 def parse_args():
     parser = argparse.ArgumentParser(description='AVF内瘘堵塞迁移学习')
     
-    parser.add_argument('--data_folder', type=str, default="/home/swucar/cyz/2 pos",
+    parser.add_argument('--data_folder', type=str, 
+                        default="/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/data/九院自采数据集/分段后数据（可直接输入模型）/2 pos",
                         help='数据文件夹路径，包含CSV文件')
     
     parser.add_argument('--pretrained_model', type=str, 
-                        default="/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/pretrain/模型output/ppg_pretrain_20250920_151959_epoch5.pth",
+                        default="/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/pretrain/模型output/ppg_pretrain_20251017_163254_encoder_best.pth",
                         help='预训练编码器模型路径')
     
     parser.add_argument('--save_dir', type=str, 
-                        default="./avf_transfer_results/最新5.5",
+                        default="/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/深度学习/Transfer_learning/avf_transfer_results",
                         help='保存结果的目录')
     
     parser.add_argument('--seed', type=int, default=42,
