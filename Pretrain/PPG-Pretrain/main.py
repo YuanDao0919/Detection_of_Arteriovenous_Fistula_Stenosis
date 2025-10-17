@@ -13,7 +13,7 @@ from torch.optim import Adam
 # 导入自定义模块
 from data import PPGDataset
 from models import PPGPretrainModel
-from train import train, validate, set_seed, visualize_reconstruction
+from train import train, validate, set_seed, visualize_reconstruction, generate_ig_visualization
 
 # 忽略UserWarning，避免不必要的警告干扰训练日志
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -236,6 +236,27 @@ def main():
                 'scheduler_state_dict': scheduler.state_dict(),
                 'val_loss': val_loss,
             }, f"{save_dir}/{model_name}_epoch{epoch}.pth")
+
+        # 每个 epoch 末尾生成一次 IG 可解释性图像（选取验证集的第一个样本）
+        try:
+            ig_save = os.path.join('/Users/yuandao/YuanDao/AI与新医药/动静脉内瘘狭窄检测/代码/pretrain/PPG-Pretrain/explain-figs', f'ig_epoch{epoch}.png')
+            # 从验证集拿一个样本
+            val_sample = next(iter(val_loader))
+            sample_signal = val_sample[0] if isinstance(val_sample, (list, tuple)) else val_sample[0]
+            sample_signal = sample_signal.to(device)
+            generate_ig_visualization(
+                model,
+                sample_signal=sample_signal,
+                device=device,
+                save_path=ig_save,
+                mask_ratio=mask_ratio,
+                steps=64,
+                baseline='zero',
+                seed=42
+            )
+            print(f"IG 可解释性图像已保存: {ig_save}")
+        except Exception as e:
+            print(f"生成IG图像失败（跳过，不影响训练）：{e}")
     
     # ================ 保存最终模型 ================
     print("训练完成，保存最终模型...")

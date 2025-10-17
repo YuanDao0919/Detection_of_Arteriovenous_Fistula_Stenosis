@@ -186,4 +186,4 @@ def masked_reconstruction_loss(original, reconstructed, mask, reduction='mean'):
         original[mask], 
         reduction=reduction
     )
-    return mse_loss 
+    return mse_loss

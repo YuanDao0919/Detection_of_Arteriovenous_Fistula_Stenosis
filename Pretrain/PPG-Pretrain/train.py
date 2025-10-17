@@ -4,7 +4,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 import random
-from data import DataAugmenter
+from data import DataAugmenter, MaskGenerator
+from captum.attr import IntegratedGradients
+import torch.nn.functional as F
 
 def set_seed(seed):
     """
@@ -229,3 +231,91 @@ def validate(model, val_loader, device, lambda_contrast=1.0, lambda_recon=1.0):
     avg_loss = total_loss / len(val_loader)
     
     return avg_contrast_loss, avg_recon_loss, avg_loss 
+
+
+def _build_ig_forward_func(model, mask_bool_1d: torch.Tensor, device: torch.device):
+    mask_bool_1d = mask_bool_1d.to(device)
+
+    def forward_func(x: torch.Tensor):
+        # x: [B, L]
+        masked = x.masked_fill(mask_bool_1d.unsqueeze(0), 0.0)
+        z = model.encoder(masked)
+        recon = model.decoder(z)
+        loss = F.mse_loss(recon[:, mask_bool_1d], x[:, mask_bool_1d], reduction='mean')
+        score = -loss
+        return score.repeat(x.shape[0])
+
+    return forward_func
+
+
+def generate_ig_visualization(model,
+                              sample_signal: torch.Tensor,
+                              device: torch.device,
+                              save_path: str,
+                              mask_ratio: float = None,
+                              steps: int = 64,
+                              baseline: str = 'zero',
+                              seed: int = 42):
+    """
+    生成并保存单样本的 Integrated Gradients 可解释性图像。
+    sample_signal: [L] (float32)
+    """
+    # 固定随机性，用于生成稳定掩码
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    model_eval_prev = not model.training
+    model.eval()
+
+    x = sample_signal.unsqueeze(0).to(device)  # [1, L]
+    length = x.shape[1]
+
+    if mask_ratio is None:
+        mask_ratio = getattr(getattr(model, 'mask_generator', None), 'mask_ratio', 0.2)
+
+    mg = MaskGenerator(mask_ratio=mask_ratio)
+    mask_bool = mg.generate_mask(length)
+
+    forward_func = _build_ig_forward_func(model, mask_bool, device)
+    ig = IntegratedGradients(forward_func)
+
+    if baseline == 'zero':
+        base = torch.zeros_like(x)
+    else:
+        mean_val = x.mean(dim=1, keepdim=True)
+        base = torch.ones_like(x) * mean_val
+
+    attributions, _ = ig.attribute(x, baselines=base, n_steps=steps, return_convergence_delta=True)
+
+    sig_np = x.detach().cpu().numpy()[0]
+    attr_np = attributions.detach().cpu().numpy()[0]
+
+    t = np.arange(sig_np.shape[0])
+    attr_abs = np.abs(attr_np)
+    if attr_abs.max() > 0:
+        attr_norm = attr_np / (attr_abs.max() + 1e-8)
+    else:
+        attr_norm = attr_np
+
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+
+    plt.figure(figsize=(12, 6))
+    plt.subplot(2, 1, 1)
+    plt.plot(t, sig_np, label='PPG')
+    plt.title('Original PPG')
+    plt.grid(True)
+
+    plt.subplot(2, 1, 2)
+    plt.plot(t, attr_norm, color='crimson', label='IG (signed, normalized)')
+    plt.fill_between(t, 0, attr_norm, color='crimson', alpha=0.2)
+    plt.title(f'IG (steps={steps}, baseline={baseline})')
+    plt.xlabel('Time')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+    # 恢复训练状态
+    if not model_eval_prev:
+        model.train()
