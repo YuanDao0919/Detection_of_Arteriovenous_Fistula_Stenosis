@@ -1,0 +1,13 @@
+{
+    "data_dir": "/Users/yuandao/YuanDao/AI\u4e0e\u65b0\u533b\u836f/\u52a8\u9759\u8109\u5185\u7618\u72ed\u7a84\u68c0\u6d4b/\u4ee3\u7801/data/\u9884\u8bad\u7ec3\u7684PPG\u6570\u636e\u96c6/\u5904\u7406\u540e\u7684\u516c\u5f00PPG\u6570\u636e\u96c6",
+    "batch_size": 64,
+    "epochs": 5,
+    "learning_rate": 0.0001,
+    "feature_dim": 512,
+    "signal_length": 600,
+    "mask_ratio": 0.05,
+    "lambda_contrast": 1.0,
+    "lambda_recon": 1.5,
+    "timestamp": "20251013_151115",
+    "use_cross_gating": true
+}
